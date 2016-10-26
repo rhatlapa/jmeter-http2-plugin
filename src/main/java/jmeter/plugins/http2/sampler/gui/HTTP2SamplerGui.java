@@ -16,41 +16,30 @@
 package jmeter.plugins.http2.sampler.gui;
 
 import jmeter.plugins.http2.sampler.HTTP2Sampler;
-import org.apache.jmeter.gui.util.HorizontalPanel;
+import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.config.gui.ArgumentsPanel;
 import org.apache.jmeter.samplers.gui.AbstractSamplerGui;
 import org.apache.jmeter.testelement.TestElement;
-import org.apache.jorphan.gui.JLabeledChoice;
 import org.apache.jorphan.logging.LoggingManager;
 import org.apache.log.Logger;
 
 import java.awt.*;
-import javax.swing.*;
 
 public class HTTP2SamplerGui extends AbstractSamplerGui {
 
     private static final Logger log = LoggingManager.getLoggerForClass();
 
-    private JLabeledChoice method;
-    private JTextField scheme;
-    private JTextField domain;
-    private JTextField port;
-    private JTextField path;
+    private HTTP2SamplerPanel http2SamplerPanel;
 
     public HTTP2SamplerGui(){
         super();
+        init();
 
         setLayout(new BorderLayout(0, 5));
         setBorder(makeBorder());
 
         this.add(makeTitlePanel(), BorderLayout.NORTH);
-
-        JPanel webRequestPanel = new JPanel();
-        webRequestPanel.setLayout(new BorderLayout());
-
-        webRequestPanel.add(getWebServerPanel(), BorderLayout.NORTH);
-        webRequestPanel.add(getPathPanel(), BorderLayout.CENTER);
-
-        this.add(webRequestPanel, BorderLayout.CENTER);
+        this.add(http2SamplerPanel, BorderLayout.CENTER);
     }
 
     @Override
@@ -74,92 +63,60 @@ public class HTTP2SamplerGui extends AbstractSamplerGui {
     public void configure(TestElement element) {
         super.configure(element);
 
-        HTTP2Sampler sampler = (HTTP2Sampler)element;
-        /* method.setText(sampler.getMethod()); */
-        scheme.setText(sampler.getScheme());
-        domain.setText(sampler.getDomain());
-        port.setText(sampler.getPortAsString());
-        path.setText(sampler.getPath());
+        if (element instanceof HTTP2Sampler) {
+            HTTP2Sampler sampler = (HTTP2Sampler) element;
+            /* method.setText(sampler.getMethod()); */
+            http2SamplerPanel.setProtocol(sampler.getProtocolScheme());
+            http2SamplerPanel.setServerAddress(sampler.getServerAddress());
+            http2SamplerPanel.setServerPort(sampler.getServerPort());
+            http2SamplerPanel.setContextPath(sampler.getContextPath());
+
+            http2SamplerPanel.setProtocol(sampler.getProtocolScheme());
+            http2SamplerPanel.setContentEncoding(sampler.getContentEncoding());
+            http2SamplerPanel.setResponseTimeout(sampler.getResponseTimeout());
+            http2SamplerPanel.setConnectionTimeout(sampler.getConnectionTimeout());
+            http2SamplerPanel.setIgnoreSslErrors(sampler.isIgnoreSslErrors());
+            http2SamplerPanel.setStreamingConnection(sampler.isStreamingConnection());
+            http2SamplerPanel.setConnectionId(sampler.getConnectionId());
+
+            Arguments queryStringParameters = sampler.getQueryStringParameters();
+            if (queryStringParameters != null) {
+                http2SamplerPanel.getAttributePanel().configure(queryStringParameters);
+            }
+        }
     }
 
     public void modifyTestElement(TestElement element) {
         configureTestElement(element);
-        /* element.setProperty(HTTP2Sampler.METHOD, method.getText()); */
-        element.setProperty(HTTP2Sampler.METHOD, HTTP2Sampler.DEFAULT_METHOD);
-        element.setProperty(HTTP2Sampler.SCHEME, scheme.getText());
-        element.setProperty(HTTP2Sampler.DOMAIN, domain.getText());
-        element.setProperty(HTTP2Sampler.PORT, port.getText());
-        element.setProperty(HTTP2Sampler.PATH, path.getText());
+        if (element instanceof HTTP2Sampler) {
+            HTTP2Sampler http2Sampler = (HTTP2Sampler) element;
+            http2Sampler.setServerAddress(http2SamplerPanel.getServerAddress());
+            http2Sampler.setServerPort(http2SamplerPanel.getServerPort());
+            http2Sampler.setProtocolScheme(http2SamplerPanel.getProtocol());
+            http2Sampler.setContextPath(http2SamplerPanel.getContextPath());
+            http2Sampler.setContentEncoding(http2SamplerPanel.getContentEncoding());
+            http2Sampler.setConnectionTimeout(http2SamplerPanel.getConnectionTimeout());
+            http2Sampler.setResponseTimeout(http2SamplerPanel.getResponseTimeout());
+            http2Sampler.setIgnoreSslErrors(http2SamplerPanel.isIgnoreSslErrors());
+            http2Sampler.setStreamingConnection(http2SamplerPanel.isStreamingConnection());
+            http2Sampler.setConnectionId(http2SamplerPanel.getConnectionId());
+
+
+            ArgumentsPanel queryStringParameters = http2SamplerPanel.getAttributePanel();
+            if (queryStringParameters != null) {
+                http2Sampler.setQueryStringParameters((Arguments)queryStringParameters.createTestElement());
+            }
+        }
+        
+      
     }
 
-    private final JPanel getWebServerPanel() {
-        JPanel webServerPanel = new HorizontalPanel();
-
-        final JPanel schemePanel = getSchemePanel();
-        final JPanel domainPanel = getDomainPanel();
-        final JPanel portPanel = getPortPanel();
-
-        webServerPanel.add(schemePanel, BorderLayout.WEST);
-        webServerPanel.add(domainPanel, BorderLayout.CENTER);
-        webServerPanel.add(portPanel, BorderLayout.EAST);
-
-        return webServerPanel;
+    @Override
+    public void clearGui() {
+        super.clearGui();
     }
 
-    private final JPanel getSchemePanel() {
-        scheme = new JTextField(10);
-
-        JLabel label = new JLabel("Scheme");
-        label.setLabelFor(scheme);
-
-        JPanel panel = new JPanel(new BorderLayout(5, 0));
-        panel.add(label, BorderLayout.WEST);
-        panel.add(scheme, BorderLayout.CENTER);
-
-        return panel;
+    private void init() {
+        http2SamplerPanel = new HTTP2SamplerPanel();
     }
-
-    private final JPanel getDomainPanel() {
-        domain = new JTextField(20);
-
-        JLabel label = new JLabel("Domain");
-        label.setLabelFor(domain);
-
-        JPanel panel = new JPanel(new BorderLayout(5, 0));
-        panel.add(label, BorderLayout.WEST);
-        panel.add(domain, BorderLayout.CENTER);
-
-        return panel;
-    }
-
-    private final JPanel getPortPanel() {
-        port = new JTextField(10);
-
-        JLabel label = new JLabel("Port");
-        label.setLabelFor(port);
-
-        JPanel panel = new JPanel(new BorderLayout(5, 0));
-        panel.add(label, BorderLayout.WEST);
-        panel.add(port, BorderLayout.CENTER);
-
-        return panel;
-    }
-
-    private final JPanel getPathPanel() {
-        path = new JTextField(15);
-
-        JLabel label = new JLabel("Path");
-        label.setLabelFor(path);
-
-        JPanel pathPanel = new HorizontalPanel();
-        pathPanel.add(label);
-        pathPanel.add(path);
-
-        JPanel panel = new JPanel();
-        panel.setLayout(new BoxLayout(panel, BoxLayout.Y_AXIS));
-        panel.add(pathPanel);
-
-        return panel;
-    }
-
 }

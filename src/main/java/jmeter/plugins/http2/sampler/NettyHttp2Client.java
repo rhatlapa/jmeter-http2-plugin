@@ -15,12 +15,6 @@
  */
 package jmeter.plugins.http2.sampler;
 
-import io.netty.bootstrap.Bootstrap;
-import io.netty.channel.Channel;
-import io.netty.channel.ChannelOption;
-import io.netty.channel.EventLoopGroup;
-import io.netty.channel.nio.NioEventLoopGroup;
-import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.DefaultFullHttpRequest;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
@@ -40,21 +34,23 @@ import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
 import io.netty.util.AsciiString;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
-import org.apache.jmeter.samplers.SampleResult;
+import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.testelement.property.CollectionProperty;
 import org.apache.jmeter.testelement.property.PropertyIterator;
+import org.apache.jorphan.logging.LoggingManager;
+import org.apache.log.Logger;
 
 import java.net.MalformedURLException;
 import java.net.URI;
 import java.util.Iterator;
 import java.util.Map.Entry;
-import java.util.SortedMap;
-import java.util.concurrent.TimeUnit;
 import javax.net.ssl.SSLException;
 
 import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
 
 public class NettyHttp2Client {
+    private static final Logger log = LoggingManager.getLoggerForClass();
+
     private final String method;
     private final String scheme;
     private final String host;
@@ -62,7 +58,7 @@ public class NettyHttp2Client {
     private final String path;
     private final HeaderManager headerManager;
 
-    private Bootstrap b;
+    private final SslContext sslCtx;
 
     public NettyHttp2Client(String method, String host, int port, String path, HeaderManager headerManager, String scheme) {
         this.method = method;
@@ -71,48 +67,29 @@ public class NettyHttp2Client {
         this.path = path;
         this.headerManager = headerManager;
         this.scheme = scheme;
-    }
-
-    public SampleResult request() {
-        SampleResult sampleResult = new SampleResult();
-
-        SslContext sslCtx = null;
         if ("https".equals(scheme)) {
             sslCtx = getSslContext();
             if (sslCtx == null) {
-                sampleResult.setSuccessful(false);
-                return sampleResult;
+                throw new RuntimeException("Failed to create SSL context for https");
             }
+        } else {
+            sslCtx = null;
         }
+    }
+
+    public HTTPSampleResult request() {
+        HTTPSampleResult sampleResult = new HTTPSampleResult();
 
         // Configure the client.
-        EventLoopGroup workerGroup = new NioEventLoopGroup();
-        try {
-            Http2ClientInitializer initializer = new Http2ClientInitializer(sslCtx, Integer.MAX_VALUE);
-            Bootstrap b = new Bootstrap();
-            b.group(workerGroup);
-            b.channel(NioSocketChannel.class);
-            b.option(ChannelOption.SO_KEEPALIVE, true);
-            b.remoteAddress(host, port);
-            b.handler(initializer);
+        try (Http2Client http2Client = new Http2Client(sslCtx, host, port)) {
+            http2Client.init();
 
             // Start sampling
             sampleResult.sampleStart();
 
             // Start the client.
-            Channel channel = b.connect().syncUninterruptibly().channel();
+            http2Client.start();
 
-            // Wait for the HTTP/2 upgrade to occur.
-            Http2SettingsHandler http2SettingsHandler = initializer.settingsHandler();
-            try {
-                http2SettingsHandler.awaitSettings(5, TimeUnit.SECONDS);
-            } catch (Exception exception) {
-                sampleResult.setSuccessful(false);
-                return sampleResult;
-            }
-
-            HttpResponseHandler responseHandler = initializer.responseHandler();
-            final int streamId = 3;
             final URI hostName = URI.create(scheme + "://" + host + ':' + port);
 
             // Set attributes to SampleResult
@@ -141,15 +118,9 @@ public class NettyHttp2Client {
                 }
             }
 
-            responseHandler.put(streamId, channel.newPromise());
-            channel.writeAndFlush(request);
-
-            final SortedMap<Integer, FullHttpResponse> responseMap;
+            int streamId = 3;
             try {
-                responseMap = responseHandler.awaitResponses(10, TimeUnit.SECONDS);
-
-                // Currently pick up only one response of a stream
-                final FullHttpResponse response = responseMap.get(streamId);
+                final FullHttpResponse response = http2Client.sendRequest(request, streamId);
                 final AsciiString responseCode = response.status().codeAsText();
                 final String reasonPhrase = response.status().reasonPhrase();
                 sampleResult.setResponseCode(new StringBuilder(responseCode.length()).append(responseCode).toString());
@@ -160,14 +131,13 @@ public class NettyHttp2Client {
                 return sampleResult;
             }
 
-            // Wait until the connection is closed.
-            channel.close().syncUninterruptibly();
+            http2Client.stop();
 
             // End sampling
             sampleResult.sampleEnd();
             sampleResult.setSuccessful(true);
-        } finally {
-            workerGroup.shutdownGracefully();
+        } catch (Exception ex) {
+            sampleResult.setSuccessful(false);
         }
 
         return sampleResult;
