@@ -15,11 +15,14 @@
  */
 package jmeter.plugins.http2.sampler;
 
-import io.netty.handler.codec.http.DefaultFullHttpRequest;
+import io.netty.bootstrap.Bootstrap;
+import io.netty.channel.Channel;
+import io.netty.channel.ChannelOption;
+import io.netty.channel.EventLoopGroup;
+import io.netty.channel.nio.NioEventLoopGroup;
+import io.netty.channel.socket.nio.NioSocketChannel;
 import io.netty.handler.codec.http.FullHttpRequest;
 import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpHeaderNames;
-import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http2.Http2SecurityUtil;
 import io.netty.handler.ssl.ApplicationProtocolConfig;
 import io.netty.handler.ssl.ApplicationProtocolConfig.Protocol;
@@ -32,118 +35,147 @@ import io.netty.handler.ssl.SslContextBuilder;
 import io.netty.handler.ssl.SslProvider;
 import io.netty.handler.ssl.SupportedCipherSuiteFilter;
 import io.netty.handler.ssl.util.InsecureTrustManagerFactory;
-import io.netty.util.AsciiString;
-import org.apache.jmeter.protocol.http.control.HeaderManager;
-import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
-import org.apache.jmeter.testelement.property.CollectionProperty;
-import org.apache.jmeter.testelement.property.PropertyIterator;
 import org.apache.jorphan.logging.LoggingManager;
 import org.apache.log.Logger;
 
-import java.net.MalformedURLException;
-import java.net.URI;
 import java.util.Iterator;
 import java.util.Map.Entry;
+import java.util.SortedMap;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 import javax.net.ssl.SSLException;
 
-import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
+public class NettyHttp2Client implements Http2Client {
 
-public class NettyHttp2Client {
     private static final Logger log = LoggingManager.getLoggerForClass();
 
-    private final String method;
-    private final String scheme;
+    private EventLoopGroup workerGroup;
+    private final Bootstrap bootstrap = new Bootstrap();
     private final String host;
     private final int port;
-    private final String path;
-    private final HeaderManager headerManager;
+    private final Http2ClientInitializer http2ClientInitializer;
+    private HttpResponseHandler responseHandler;
+    private Channel channel = null;
+    private HTTP2Sampler http2Sampler;
+    private CountDownLatch closeLatch = new CountDownLatch(1);
 
-    private final SslContext sslCtx;
+    private final AtomicInteger streamId = new AtomicInteger(3);
 
-    public NettyHttp2Client(String method, String host, int port, String path, HeaderManager headerManager, String scheme) {
-        this.method = method;
-        this.host = host;
-        this.port = port;
-        this.path = path;
-        this.headerManager = headerManager;
-        this.scheme = scheme;
-        if ("https".equals(scheme)) {
-            sslCtx = getSslContext();
-            if (sslCtx == null) {
-                throw new RuntimeException("Failed to create SSL context for https");
-            }
+    private StringBuilder logMessage = new StringBuilder();
+
+    public NettyHttp2Client(HTTP2Sampler sampler) {
+        this.http2Sampler = sampler;
+        logMessage.append("\n\n[Execution Flow]\n");
+        logMessage.append(" - Opening new connection\n");
+        this.host = sampler.getServerAddress();
+        this.port = sampler.getServerPortAsInt();
+        SslContext sslCtx = null;
+        if ("https".equals(sampler.getProtocolScheme())) {
+            sslCtx = NettyHttp2Client.getSslContext();
+        }
+        this.workerGroup = new NioEventLoopGroup();
+        this.http2ClientInitializer = new Http2ClientInitializer(sslCtx, Integer.MAX_VALUE);
+    }
+
+    public void init() {
+        bootstrap.group(workerGroup);
+        bootstrap.channel(NioSocketChannel.class);
+        bootstrap.option(ChannelOption.SO_KEEPALIVE, true);
+        bootstrap.remoteAddress(host, port);
+        bootstrap.handler(http2ClientInitializer);
+    }
+
+    public void initialize(HTTP2Sampler sampler) {
+        this.http2Sampler = sampler;
+        this.closeLatch = new CountDownLatch(1);
+        this.logMessage = new StringBuilder();
+        this.logMessage.append("\n\n[Execution Flow]\n");
+        this.logMessage.append(" - Reusing existing connection: ").append(http2Sampler.getConnectionId()).append('\n');
+
+    }
+
+    public void start() throws Exception {
+        // Start the client.
+        if (isConnected()) {
+            throw new IllegalStateException("Client already started");
         } else {
-            sslCtx = null;
+            log.debug("Started new HTTP2 client");
+            channel = bootstrap.connect().syncUninterruptibly().channel();
+            initSettings();
+            initResponseHandler();
         }
     }
 
-    public HTTPSampleResult request() {
-        HTTPSampleResult sampleResult = new HTTPSampleResult();
+    private void initResponseHandler() {
+        responseHandler = http2ClientInitializer.responseHandler();
+    }
 
-        // Configure the client.
-        try (Http2Client http2Client = new Http2Client(sslCtx, host, port)) {
-            http2Client.init();
+    public FullHttpResponse sendRequest(FullHttpRequest request) {
+        int streamIdAsInt = streamId.getAndAdd(2);
+        log.debug("Sending request and expecting response on stream " + streamIdAsInt);
+        responseHandler.put(streamIdAsInt, channel.newPromise());
+        channel.writeAndFlush(request);
+        final SortedMap<Integer, FullHttpResponse> responseMap = responseHandler.awaitResponses(10, TimeUnit.SECONDS);
+        return responseMap.get(streamIdAsInt);
+    }
 
-            // Start sampling
-            sampleResult.sampleStart();
+    public void stop() {
+        if (!isConnected()) {
+            throw new IllegalStateException("Client is not running");
+        } else {
+            log.debug("Stopping HTTP2 client");
+            channel.close().syncUninterruptibly();
+            channel = null;
+            closeLatch.countDown();
+        }
+    }
 
-            // Start the client.
-            http2Client.start();
+    private void initSettings() throws Exception {
+        // Wait for the HTTP/2 upgrade to occur.
+        Http2SettingsHandler http2SettingsHandler = http2ClientInitializer.settingsHandler();
+        http2SettingsHandler.awaitSettings(5, TimeUnit.SECONDS);
+    }
 
-            final URI hostName = URI.create(scheme + "://" + host + ':' + port);
+    /**
+     * @return true if client is connected (channel is opened), false otherwise;
+     */
+    public boolean isConnected() {
+        return (channel != null) && channel.isOpen();
+    }
 
-            // Set attributes to SampleResult
+    public void leaveConnectionOpen() {
+        if (isConnected()) {
+            logMessage.append(" - Leaving streaming connection open").append('\n');
+        }
+    }
+
+    @Override
+    public void close() throws Exception {
+        if (workerGroup != null) {
+            log.debug("Closing the client and its connection");
+            logMessage.append("Closing the client and its connection");
             try {
-                sampleResult.setURL(hostName.toURL());
-            } catch (MalformedURLException exception) {
-                sampleResult.setSuccessful(false);
-                return sampleResult;
-            }
-
-            String requestPath = (path.startsWith("/")) ? hostName.toString() + path : path;
-
-            FullHttpRequest request = new DefaultFullHttpRequest(HTTP_1_1, new HttpMethod(method), requestPath);
-            request.headers().add(HttpHeaderNames.HOST, hostName);
-
-            // Add request headers set by HeaderManager
-            if (headerManager != null) {
-                CollectionProperty headers = headerManager.getHeaders();
-                if (headers != null) {
-                    PropertyIterator i = headers.iterator();
-                    while (i.hasNext()) {
-                        org.apache.jmeter.protocol.http.control.Header header
-                                = (org.apache.jmeter.protocol.http.control.Header) i.next().getObjectValue();
-                        request.headers().add(header.getName(), header.getValue());
-                    }
+                if (isConnected()) {
+                    stop();
                 }
+            } finally {
+                log.debug("Shutting down worker group used by the HTTP2 client");
+                workerGroup.shutdownGracefully();
+                if (!workerGroup.awaitTermination(5, TimeUnit.SECONDS)) {
+                    log.warn("Worker group wasn't fully terminated after specified timeout");
+                }
+                workerGroup = null;
             }
-
-            int streamId = 3;
-            try {
-                final FullHttpResponse response = http2Client.sendRequest(request, streamId);
-                final AsciiString responseCode = response.status().codeAsText();
-                final String reasonPhrase = response.status().reasonPhrase();
-                sampleResult.setResponseCode(new StringBuilder(responseCode.length()).append(responseCode).toString());
-                sampleResult.setResponseMessage(new StringBuilder(reasonPhrase.length()).append(reasonPhrase).toString());
-                sampleResult.setResponseHeaders(getResponseHeaders(response));
-            } catch (Exception exception) {
-                sampleResult.setSuccessful(false);
-                return sampleResult;
-            }
-
-            http2Client.stop();
-
-            // End sampling
-            sampleResult.sampleEnd();
-            sampleResult.setSuccessful(true);
-        } catch (Exception ex) {
-            sampleResult.setSuccessful(false);
         }
-
-        return sampleResult;
     }
 
-    private SslContext getSslContext() {
+    public String getLogMessage() {
+        return logMessage.toString();
+    }
+
+
+    public static SslContext getSslContext() {
         SslContext sslCtx = null;
 
         final SslProvider provider = OpenSsl.isAlpnSupported() ? SslProvider.OPENSSL : SslProvider.JDK;
@@ -169,7 +201,7 @@ public class NettyHttp2Client {
     /**
      * Convert Response headers set by Netty stack to one String instance
      */
-    private String getResponseHeaders(FullHttpResponse response) {
+    public static String getResponseHeaders(FullHttpResponse response) {
         StringBuilder headerBuf = new StringBuilder();
 
         Iterator<Entry<String, String>> iterator = response.headers().iteratorAsString();
