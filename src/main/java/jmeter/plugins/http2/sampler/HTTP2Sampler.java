@@ -24,6 +24,7 @@ import io.netty.util.AsciiString;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.jmeter.config.Argument;
 import org.apache.jmeter.config.Arguments;
+import org.apache.jmeter.protocol.http.control.CacheManager;
 import org.apache.jmeter.protocol.http.control.CookieHandler;
 import org.apache.jmeter.protocol.http.control.CookieManager;
 import org.apache.jmeter.protocol.http.control.HeaderManager;
@@ -40,6 +41,7 @@ import org.apache.jmeter.testelement.ThreadListener;
 import org.apache.jmeter.testelement.property.CollectionProperty;
 import org.apache.jmeter.testelement.property.PropertyIterator;
 import org.apache.jmeter.testelement.property.TestElementProperty;
+import org.apache.jmeter.util.JMeterUtils;
 import org.apache.jorphan.logging.LoggingManager;
 import org.apache.jorphan.reflect.ClassTools;
 import org.apache.jorphan.util.JMeterException;
@@ -72,19 +74,21 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
     private static final String QRY_SEP = "&"; // $NON-NLS-1$
 
     public static final String DEFAULT_METHOD = "GET";
+    public static final String RETURN_NO_SAMPLE = "RETURN_NO_SAMPLE";
+    public static final String CUSTOM_STATUS_CODE= "RETURN_CUSTOM_STATUS.code";
+    public static final String CACHED_MODE_PROPERTY = "cache_manager.cached_resource_mode";
 
     private static final Map<String, Http2Client> connectionsMap = Collections.synchronizedMap(new HashMap<String, Http2Client>());
 
     private HeaderManager headerManager;
     private CookieManager cookieManager;
     private CookieHandler cookieHandler;
-
+    private CacheManager cacheManager;
 
     public HTTP2Sampler() {
         super();
         setName("HTTP2 Sampler");
     }
-
 
     public URI getUri() throws URISyntaxException {
         String path = this.getContextPath();
@@ -147,7 +151,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         return buf.toString();
     }
 
-
     @Override
     public void setName(String name) {
         if (name != null) {
@@ -171,11 +174,12 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             } catch (JMeterException e) {
                 log.error("Failed to construct cookie handler ", e);
             }
+        } else if (el instanceof CacheManager) {
+            cacheManager = (CacheManager) el;
         } else {
             super.addTestElement(el);
         }
     }
-
 
     @Override
     public SampleResult sample(Entry entry) {
@@ -205,7 +209,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             addSocketToMap = true;
         }
 
-
         http2Client.init();
         http2Client.start();
 
@@ -220,6 +223,7 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         HeaderManager headerManager = (HeaderManager) getProperty(HTTPSamplerBase.HEADER_MANAGER).getObjectValue();
 
         HTTPSampleResult sampleResult = new HTTPSampleResult();
+        sampleResult.setHTTPMethod(DEFAULT_METHOD);
         sampleResult.setSampleLabel(getName());
 
         //This StringBuilder will track all exceptions related to the protocol processing
@@ -228,6 +232,23 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
 
         //Could improve precission by moving this closer to the action
         sampleResult.sampleStart();
+        URL requestUrl = url;
+        if (url == null) {
+            try {
+                requestUrl = getUri().toURL();
+            } catch (Exception e) {
+                sampleResult.setSuccessful(false);
+                return sampleResult;
+            }
+        }
+        sampleResult.setURL(requestUrl);
+
+        if (cacheManager != null) {
+            if (cacheManager.inCache(requestUrl)) {
+                log.debug("Request for " + sampleResult.getUrlAsString() + " was loaded from cache!");
+                return updateResultFromCache(sampleResult);
+            }
+        }
 
         boolean isOK = false;
 
@@ -244,14 +265,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                 return sampleResult;
             }
 
-            URL requestUrl = url;
-            if (url == null) {
-                requestUrl = getUri().toURL();
-            }
-
-            sampleResult.setURL(url);
-
-
             FullHttpRequest request = new DefaultFullHttpRequest(HTTP_1_1, new HttpMethod(method), requestUrl.toExternalForm());
             request.headers().add(HttpHeaderNames.HOST, String.format("%s:%s", requestUrl.getHost(), requestUrl.getPort()));
             if (cookieManager != null) {
@@ -263,7 +276,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                     }
                 }
             }
-
 
             // Add request headers set by HeaderManager
             if (headerManager != null) {
@@ -278,27 +290,26 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                 }
             }
 
-            try {
-                final FullHttpResponse response = http2Client.sendRequest(request);
-                final AsciiString responseCode = response.status().codeAsText();
-                final String reasonPhrase = response.status().reasonPhrase();
-                sampleResult.setResponseCode(new StringBuilder(responseCode.length()).append(responseCode).toString());
-                sampleResult.setResponseMessage(new StringBuilder(reasonPhrase.length()).append(reasonPhrase).toString());
-                sampleResult.setResponseHeaders(NettyHttp2Client.getResponseHeaders(response));
-                if (cookieManager != null && cookieHandler != null) {
-                    String setCookieHeader = response.headers().get("set-cookie");
-                    if (setCookieHeader != null) {
-                        cookieHandler.addCookieFromHeader(cookieManager, true, setCookieHeader, new URL(
-                                requestUrl.getProtocol(),
-                                requestUrl.getHost(),
-                                requestUrl.getPort(),
-                                requestUrl.getQuery() != null ? requestUrl.getPath() + "?" + requestUrl.getQuery() : requestUrl.getPath()
-                        ));
-                    }
+            final FullHttpResponse response = http2Client.sendRequest(request);
+            final AsciiString responseCode = response.status().codeAsText();
+            final String reasonPhrase = response.status().reasonPhrase();
+            sampleResult.setResponseCode(new StringBuilder(responseCode.length()).append(responseCode).toString());
+            sampleResult.setResponseMessage(new StringBuilder(reasonPhrase.length()).append(reasonPhrase).toString());
+            sampleResult.setResponseHeaders(NettyHttp2Client.getResponseHeaders(response));
+            if (cookieManager != null && cookieHandler != null) {
+                String setCookieHeader = response.headers().get("set-cookie");
+                if (setCookieHeader != null) {
+                    cookieHandler.addCookieFromHeader(cookieManager, true, setCookieHeader, new URL(
+                            requestUrl.getProtocol(),
+                            requestUrl.getHost(),
+                            requestUrl.getPort(),
+                            requestUrl.getQuery() != null ? requestUrl.getPath() + "?" + requestUrl.getQuery() : requestUrl.getPath()
+                    ));
                 }
-            } catch (Exception exception) {
-                sampleResult.setSuccessful(false);
-                return sampleResult;
+            }
+            if (cacheManager != null) {
+                log.debug("Sample for " + sampleResult.getUrlAsString() + " was saved to cache!");
+                cacheManager.saveDetails(HttpResponseAdapter.wrapAsApacheHttpReponse(response), sampleResult);
             }
 
             if (isStreamingConnection()) {
@@ -341,7 +352,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             return sampleResult;
         }
     }
-
 
     public void setMethod(String value) {
         setProperty(METHOD, value);
@@ -409,7 +419,6 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
     public void setServerPort(String port) {
         setProperty("serverPort", port);
     }
-
 
     public void setQueryStringParameters(Arguments queryStringParameters) {
         setProperty(new TestElementProperty("queryStringParameters", queryStringParameters));
@@ -517,6 +526,26 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             } catch (Exception ex) {
                 log.warn("Failed to close client " + getConnectionIdForConnectionsMap(), ex);
             }
+        }
+    }
+
+    private HTTPSampleResult updateResultFromCache(HTTPSampleResult sampleResult) {
+        switch (JMeterUtils.getPropDefault(CACHED_MODE_PROPERTY, RETURN_NO_SAMPLE)) {
+            case RETURN_NO_SAMPLE:
+                return null;
+            case "RETURN_200_CACHE":
+                sampleResult.sampleEnd();
+                sampleResult.setResponseCodeOK();
+                sampleResult.setSuccessful(true);
+                return sampleResult;
+            case CUSTOM_STATUS_CODE:
+                sampleResult.sampleEnd();
+                sampleResult.setResponseCode(JMeterUtils.getProperty(CUSTOM_STATUS_CODE));
+                sampleResult.setSuccessful(true);
+                return sampleResult;
+            default:
+                // Cannot happen
+                throw new IllegalStateException("Unknown CACHED_RESOURCE_MODE");
         }
     }
 }
