@@ -15,13 +15,9 @@
  */
 package jmeter.plugins.http2.sampler;
 
-import io.netty.handler.codec.http.DefaultFullHttpRequest;
-import io.netty.handler.codec.http.FullHttpRequest;
-import io.netty.handler.codec.http.FullHttpResponse;
-import io.netty.handler.codec.http.HttpHeaderNames;
-import io.netty.handler.codec.http.HttpMethod;
 import io.netty.util.AsciiString;
 import org.apache.commons.lang3.StringUtils;
+import org.apache.http.message.BasicHttpResponse;
 import org.apache.jmeter.config.Argument;
 import org.apache.jmeter.config.Arguments;
 import org.apache.jmeter.protocol.http.control.CacheManager;
@@ -57,7 +53,10 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
 
-import static io.netty.handler.codec.http.HttpVersion.HTTP_1_1;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpURI;
+import org.eclipse.jetty.http.HttpVersion;
+import org.eclipse.jetty.http.MetaData;
 
 public class HTTP2Sampler extends AbstractSampler implements TestStateListener, ThreadListener {
     private static final long serialVersionUID = 5859387434748163229L;
@@ -75,10 +74,10 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
 
     public static final String DEFAULT_METHOD = "GET";
     public static final String RETURN_NO_SAMPLE = "RETURN_NO_SAMPLE";
-    public static final String CUSTOM_STATUS_CODE= "RETURN_CUSTOM_STATUS.code";
+    public static final String CUSTOM_STATUS_CODE = "RETURN_CUSTOM_STATUS.code";
     public static final String CACHED_MODE_PROPERTY = "cache_manager.cached_resource_mode";
 
-    private static final Map<String, Http2Client> connectionsMap = Collections.synchronizedMap(new HashMap<String, Http2Client>());
+    private static final Map<String, JettyHttp2Client> connectionsMap = Collections.synchronizedMap(new HashMap<String, JettyHttp2Client>());
 
     private HeaderManager headerManager;
     private CookieManager cookieManager;
@@ -105,7 +104,11 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         }
 
         String queryString = getQueryString(getContentEncoding());
-        return new URI(scheme, null, domain, getServerPortAsInt(), path, queryString, null);
+        if (queryString.isEmpty()) {
+            return new URI(scheme, null, domain, getServerPortAsInt(), path, null, null);
+        } else {
+            return new URI(scheme, null, domain, getServerPortAsInt(), path, queryString, null);
+        }
     }
 
     public String getQueryString(String contentEncoding) {
@@ -190,21 +193,21 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         return getThreadName() + getConnectionId();
     }
 
-    private Http2Client getHttp2Client() throws Exception {
+    private JettyHttp2Client getHttp2Client() throws Exception {
         boolean addSocketToMap = false;
 
         String connectionId = getConnectionIdForConnectionsMap();
-        Http2Client http2Client;
+        JettyHttp2Client http2Client;
 
         if (isStreamingConnection()) {
             http2Client = connectionsMap.get(connectionId);
             if (null != http2Client) {
-                http2Client.initialize(this);
+                http2Client.init();
                 return http2Client;
             }
         }
 
-        http2Client = new NettyHttp2Client(this);
+        http2Client = new JettyHttp2Client(this);
         if (isStreamingConnection()) {
             addSocketToMap = true;
         }
@@ -252,7 +255,7 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
 
         boolean isOK = false;
 
-        Http2Client http2Client = null;
+        JettyHttp2Client http2Client = null;
         try {
             http2Client = getHttp2Client();
             if (http2Client == null) {
@@ -265,14 +268,13 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                 return sampleResult;
             }
 
-            FullHttpRequest request = new DefaultFullHttpRequest(HTTP_1_1, new HttpMethod(method), requestUrl.toExternalForm());
-            request.headers().add(HttpHeaderNames.HOST, String.format("%s:%s", requestUrl.getHost(), requestUrl.getPort()));
+            MetaData.Request request = new MetaData.Request("GET", new HttpURI(requestUrl.toExternalForm()), HttpVersion.HTTP_2, new HttpFields());
             if (cookieManager != null) {
                 for (int i = 0; i < cookieManager.getCookieCount(); i++) {
                     HttpCookie cookie = new HttpCookie(cookieManager.get(i).getName(), cookieManager.get(i).getValue());
                     cookie.setVersion(cookieManager.get(i).getVersion());
                     if ("JSESSIONID".equals(cookie.getName())) {
-                        request.headers().add("Cookie", String.format("%s=%s", cookie.getName(), cookie.getValue()));
+                        request.getFields().add("Cookie", String.format("%s=%s", cookie.getName(), cookie.getValue()));
                     }
                 }
             }
@@ -285,19 +287,23 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                     while (i.hasNext()) {
                         org.apache.jmeter.protocol.http.control.Header header
                                 = (org.apache.jmeter.protocol.http.control.Header) i.next().getObjectValue();
-                        request.headers().add(header.getName(), header.getValue());
+                        request.getFields().add(header.getName(), header.getValue());
                     }
                 }
             }
 
-            final FullHttpResponse response = http2Client.sendRequest(request);
-            final AsciiString responseCode = response.status().codeAsText();
-            final String reasonPhrase = response.status().reasonPhrase();
-            sampleResult.setResponseCode(new StringBuilder(responseCode.length()).append(responseCode).toString());
-            sampleResult.setResponseMessage(new StringBuilder(reasonPhrase.length()).append(reasonPhrase).toString());
-            sampleResult.setResponseHeaders(NettyHttp2Client.getResponseHeaders(response));
+            final CustomResponse response = http2Client.sendRequest(request);
+            if(response == null){
+                sampleResult.setSuccessful(false);
+                return sampleResult;
+            }
+            final int responseCode = response.getStatus();
+            final String reasonPhrase = response.getReason();
+            sampleResult.setResponseCode(String.valueOf(responseCode));
+            sampleResult.setResponseMessage(reasonPhrase);
+            sampleResult.setResponseHeaders(http2Client.getResponseHeaders(response.getFields()));
             if (cookieManager != null && cookieHandler != null) {
-                String setCookieHeader = response.headers().get("set-cookie");
+                String setCookieHeader = response.getFields().get("set-cookie");
                 if (setCookieHeader != null) {
                     cookieHandler.addCookieFromHeader(cookieManager, true, setCookieHeader, new URL(
                             requestUrl.getProtocol(),
@@ -309,13 +315,21 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             }
             if (cacheManager != null) {
                 log.debug("Sample for " + sampleResult.getUrlAsString() + " was saved to cache!");
-                cacheManager.saveDetails(HttpResponseAdapter.wrapAsApacheHttpReponse(response), sampleResult);
+                BasicHttpResponse wrappedResponse = HttpResponseAdapter.wrapAsApacheHttpReponse(response);
+                cacheManager.saveDetails(wrappedResponse, sampleResult);
+                if(!response.getPushedResources().isEmpty()){
+                    for (URL resourceURL : response.getPushedResources()) {
+                        HTTPSampleResult res = new HTTPSampleResult();
+                        res.setURL(resourceURL);
+                        res.setSuccessful(response.getStatus() == 200);
+                        log.debug("Sample for pushed resource" + sampleResult.getUrlAsString() + " was saved to cache!");
+                        cacheManager.saveDetails(wrappedResponse, res);
+                    }
+                }
             }
 
-            if (isStreamingConnection()) {
-                http2Client.leaveConnectionOpen();
-            } else {
-                http2Client.close();
+            if (!isStreamingConnection()) {
+               http2Client.stop();
             }
             isOK = true;
 
@@ -336,7 +350,7 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
             if (http2Client != null) {
                 if (!isOK) {
                     try {
-                        http2Client.close();
+                        http2Client.stop();
                     } catch (Exception e) {
                         errorList.append(" - Closing client resulted in exception: ").append(e.getMessage()).append("\n").append(StringUtils.join(e.getStackTrace(), "\n")).append("\n");
                         isOK = false;
@@ -347,8 +361,8 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
                 }
             }
             sampleResult.setSuccessful(isOK);
-            String logMessage = (http2Client != null) ? http2Client.getLogMessage() : "";
-            sampleResult.setResponseMessage(logMessage + errorList);
+            //            String logMessage = (http2Client != null) ? http2Client.getLogMessage() : "";
+            sampleResult.setResponseMessage(errorList.toString());
             return sampleResult;
         }
     }
@@ -501,9 +515,9 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
 
     @Override
     public void testEnded(String host) {
-        for (Http2Client client : connectionsMap.values()) {
+        for (JettyHttp2Client client : connectionsMap.values()) {
             try {
-                client.close();
+                client.stop();
             } catch (Exception ex) {
                 log.warn("Failed to close HTTP/2 client", ex);
             }
@@ -518,10 +532,10 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
 
     @Override
     public void threadFinished() {
-        Http2Client client = connectionsMap.get(getConnectionIdForConnectionsMap());
+        JettyHttp2Client client = connectionsMap.get(getConnectionIdForConnectionsMap());
         if (client != null) {
             try {
-                client.close();
+                client.stop();
                 connectionsMap.remove(client);
             } catch (Exception ex) {
                 log.warn("Failed to close client " + getConnectionIdForConnectionsMap(), ex);

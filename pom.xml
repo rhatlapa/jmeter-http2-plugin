@@ -13,6 +13,7 @@
         <version.netty-all>4.1.6.Final</version.netty-all>
         <version.commons-pool2>2.4.2</version.commons-pool2>
         <version.commons-math3>3.5</version.commons-math3>
+        <jetty.version>9.4.1.v20170120</jetty.version>
     </properties>
 
     <dependencies>
@@ -76,6 +77,18 @@
             <artifactId>netty-tcnative</artifactId>
             <version>1.1.33.Fork22</version>
         </dependency>
+
+        <dependency>
+            <groupId>org.eclipse.jetty.http2</groupId>
+            <artifactId>http2-http-client-transport</artifactId>
+            <version>${jetty.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.eclipse.jetty.http2</groupId>
+            <artifactId>http2-client</artifactId>
+            <version>${jetty.version}</version>
+        </dependency>
+
     </dependencies>
 
     <build>
