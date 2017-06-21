@@ -15,7 +15,6 @@
  */
 package jmeter.plugins.http2.sampler;
 
-import io.netty.util.AsciiString;
 import org.apache.commons.lang3.StringUtils;
 import org.apache.http.message.BasicHttpResponse;
 import org.apache.jmeter.config.Argument;
@@ -28,6 +27,7 @@ import org.apache.jmeter.protocol.http.sampler.HTTPSampleResult;
 import org.apache.jmeter.protocol.http.sampler.HTTPSamplerBase;
 import org.apache.jmeter.protocol.http.util.EncoderCache;
 import org.apache.jmeter.protocol.http.util.HTTPArgument;
+import org.apache.jmeter.protocol.http.util.HTTPConstants;
 import org.apache.jmeter.samplers.AbstractSampler;
 import org.apache.jmeter.samplers.Entry;
 import org.apache.jmeter.samplers.SampleResult;
@@ -43,6 +43,10 @@ import org.apache.jorphan.reflect.ClassTools;
 import org.apache.jorphan.util.JMeterException;
 import org.apache.jorphan.util.JOrphanUtils;
 import org.apache.log.Logger;
+import org.eclipse.jetty.http.HttpFields;
+import org.eclipse.jetty.http.HttpURI;
+import org.eclipse.jetty.http.HttpVersion;
+import org.eclipse.jetty.http.MetaData;
 
 import java.io.UnsupportedEncodingException;
 import java.net.HttpCookie;
@@ -52,11 +56,6 @@ import java.net.URL;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.Map;
-
-import org.eclipse.jetty.http.HttpFields;
-import org.eclipse.jetty.http.HttpURI;
-import org.eclipse.jetty.http.HttpVersion;
-import org.eclipse.jetty.http.MetaData;
 
 public class HTTP2Sampler extends AbstractSampler implements TestStateListener, ThreadListener {
     private static final long serialVersionUID = 5859387434748163229L;
@@ -226,15 +225,13 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         HeaderManager headerManager = (HeaderManager) getProperty(HTTPSamplerBase.HEADER_MANAGER).getObjectValue();
 
         HTTPSampleResult sampleResult = new HTTPSampleResult();
-        sampleResult.setHTTPMethod(DEFAULT_METHOD);
+        sampleResult.setHTTPMethod(method);
         sampleResult.setSampleLabel(getName());
 
         //This StringBuilder will track all exceptions related to the protocol processing
         StringBuilder errorList = new StringBuilder();
         errorList.append("\n\n[Problems]\n");
 
-        //Could improve precission by moving this closer to the action
-        sampleResult.sampleStart();
         URL requestUrl = url;
         if (url == null) {
             try {
@@ -246,9 +243,14 @@ public class HTTP2Sampler extends AbstractSampler implements TestStateListener, 
         }
         sampleResult.setURL(requestUrl);
 
-        if (cacheManager != null) {
+        sampleResult.sampleStart();
+
+        // Check cache for an entry with an Expires header in the future
+        if (cacheManager != null && HTTPConstants.GET.equalsIgnoreCase(method)) {
             if (cacheManager.inCache(requestUrl)) {
-                log.debug("Request for " + sampleResult.getUrlAsString() + " was loaded from cache!");
+                if (log.isDebugEnabled()) {
+                    log.debug("Request for " + sampleResult.getUrlAsString() + " was loaded from cache!");
+                }
                 return updateResultFromCache(sampleResult);
             }
         }
